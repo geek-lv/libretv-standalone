@@ -6,6 +6,29 @@ def familyUpgrade = providers.gradleProperty('familyUpgrade').orNull == 'true'
 if (familyUpgrade) layout.buildDirectory.set(file('build-family-upgrade'))
 // No household build inputs or embedded credentials.
 
+// 正式签名: 口令文件放在项目根 keystore.properties, 它和密钥本体都在 .gitignore 里, 不入库。
+// 其中 storeFile 支持相对路径(相对项目根)或绝对路径, 直接把密钥放 keys/ 或放在项目外都行,
+// 构建脚本不假定任何人的目录结构。放在别处时用 -PkeystoreProperties=<path> 指定口令文件。
+// 缺文件或口令时回退 debug keystore, 保证刚克隆下来就能构建(产物为 debug 签名)。
+def keystoreProps = new Properties()
+def keystorePropsFile = providers.gradleProperty('keystoreProperties')
+        .map { rootProject.file(it) }
+        .getOrElse(rootProject.file('keystore.properties'))
+if (keystorePropsFile.isFile()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+def releaseStorePath = keystoreProps.getProperty('storeFile')?.trim()
+def releaseStoreFile = releaseStorePath == null ? null
+        : (new File(releaseStorePath).isAbsolute() ? new File(releaseStorePath) : new File(rootProject.projectDir, releaseStorePath))
+def hasReleaseKey = releaseStoreFile != null && releaseStoreFile.isFile()
+// 配了口令却找不到密钥时不能安静回退: 那样出来的包看着像正式版, 实际是 debug 签名
+if (releaseStorePath != null && !hasReleaseKey) {
+    println "signing: WARNING storeFile not found: ${releaseStorePath} -> debug keystore"
+}
+println "signing: " + (hasReleaseKey
+        ? "release key -> ${rootProject.relativePath(releaseStoreFile)}"
+        : "debug keystore (no usable keystore.properties)")
+
 
 android {
     namespace 'family.libretv.tv'
@@ -28,9 +51,27 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
+    signingConfigs {
+        // 正式签名优先。注意: 换成自有密钥后签名与 debug 版不同,
+        // 覆盖安装会报 INSTALL_FAILED_UPDATE_INCOMPATIBLE, 需先卸载旧版。
+        release {
+            if (hasReleaseKey) {
+                storeFile releaseStoreFile
+                storePassword keystoreProps.getProperty('storePassword')
+                keyAlias keystoreProps.getProperty('keyAlias')
+                keyPassword keystoreProps.getProperty('keyPassword')
+            } else {
+                storeFile file("${System.getProperty('user.home')}/.android/debug.keystore")
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false   // keep sherpa-onnx JNI classes intact
+            signingConfig signingConfigs.release
         }
     }
     buildFeatures { buildConfig true }

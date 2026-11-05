@@ -2,6 +2,9 @@
 .gradle/
 .idea/
 local.properties
+# 签名口令文件不该入库：一旦提交就等于把口令公开了。
+keystore.properties
+/keys/
 household.properties
 *.jks
 *.keystore
