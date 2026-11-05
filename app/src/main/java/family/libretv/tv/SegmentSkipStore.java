@@ -31,6 +31,24 @@ final class SegmentSkipStore {
     }
 
     static String summary(Context context, String title) { return new SegmentSkipStore(context, title).summary(); }
+
+    private static SharedPreferences prefs(Context context) {
+        return context.getApplicationContext().getSharedPreferences("segment-skip", Context.MODE_PRIVATE);
+    }
+
+    /** 已保存的剧名数量：只数 {@code :enabled} 键，片头或片尾单独设置时不会漏算 */
+    static int titleCount(Context context) {
+        int count = 0;
+        for (String key : prefs(context).getAll().keySet()) {
+            if (key.endsWith(":enabled")) count++;
+        }
+        return count;
+    }
+
+    /** 清空全部剧名的片头片尾记忆；不影响历史进度与收藏 */
+    static void clearAll(Context context) {
+        prefs(context).edit().clear().apply();
+    }
     private static String time(long millis) {
         return String.format(java.util.Locale.ROOT, "%02d:%02d", millis / 60000, millis / 1000 % 60);
     }

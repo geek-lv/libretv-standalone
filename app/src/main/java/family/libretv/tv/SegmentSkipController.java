@@ -21,7 +21,11 @@ final class SegmentSkipController implements Player.Listener {
     private TextView summary;
     private Button toggle;
     private Player player;
-    private boolean introPending, ignoreOutro, internalSeek, completed;
+    private boolean introPending, ignoreOutro, completed;
+    /** 自己发起的 seek（片头跳转）的登记，避免把自己的跳转当成用户拖动 */
+    private final PlayerSeekGuard ownSeek = new PlayerSeekGuard();
+    /** 其它模块（广告跳过）的 seek 登记，对方的跳转不该影响片头片尾状态 */
+    private PlayerSeekGuard foreignSeek;
     private long countdown;
     private int generation;
     private final Runnable tick = new Runnable() {
@@ -45,6 +49,10 @@ final class SegmentSkipController implements Player.Listener {
     private boolean enabled() { return store.enabled(); }
     boolean isCompleted() { return completed; }
     boolean isCountingDown() { return countdown != 0; }
+    /** 供对端判断这次跳变是不是本控制器发起的 */
+    boolean isSeekingInternally() { return ownSeek.isProgrammatic(); }
+    /** 登记对端的 seek（广告跳过），它的跳转不算用户拖动 */
+    void setForeignSeeks(PlayerSeekGuard guard) { foreignSeek = guard; }
 
     void addControls(LinearLayout parent, boolean tv) {
         LinearLayout box = new LinearLayout(context); box.setOrientation(LinearLayout.VERTICAL);
@@ -104,7 +112,10 @@ final class SegmentSkipController implements Player.Listener {
     }
 
     @Override public void onPositionDiscontinuity(Player.PositionInfo oldPosition, Player.PositionInfo newPosition, int reason) {
-        if (reason != Player.DISCONTINUITY_REASON_SEEK || internalSeek || player == null) return;
+        if (reason != Player.DISCONTINUITY_REASON_SEEK || ownSeek.isProgrammatic() || player == null) return;
+        // 广告跳过的跳转：位置变了但不是用户在看片尾。不改写 ignoreOutro、也不取消倒计时——
+        // 若真的跳出了片尾区，250ms 后的 tick 会按新位置自行收掉倒计时
+        if (foreignSeek != null && foreignSeek.isProgrammatic()) return;
         introPending = false; completed = false; cancelCountdown();
         // Seeking into the credits is an explicit request to watch them.
         ignoreOutro = SegmentSkipPolicy.inOutro(newPosition.positionMs, intro(), outro(), player.getDuration());
@@ -121,7 +132,7 @@ final class SegmentSkipController implements Player.Listener {
         if (introPending) {
             introPending = false;
             long target = SegmentSkipPolicy.introTarget(position, intro(), outro(), duration);
-            if (target >= 0) { internalSeek = true; try { player.seekTo(target); } finally { internalSeek = false; } return; }
+            if (target >= 0) { ownSeek.mark(); player.seekTo(target); return; }
         }
         if (!player.isPlaying() || ignoreOutro || !SegmentSkipPolicy.inOutro(position, intro(), outro(), duration)) {
             if (countdown != 0) { cancelCountdown(); refresh(); } return;

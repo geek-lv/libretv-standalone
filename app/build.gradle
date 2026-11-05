@@ -28,6 +28,11 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
+    buildTypes {
+        release {
+            minifyEnabled false   // keep sherpa-onnx JNI classes intact
+        }
+    }
     buildFeatures { buildConfig true }
     lint { abortOnError true }
     dependencyLocking { lockAllConfigurations() }
@@ -35,6 +40,7 @@ android {
 
 dependencies {
     implementation project(':upnpcast')
+    implementation files('libs/pinyin4j-2.5.1.jar')
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
     implementation 'androidx.media3:media3-exoplayer:1.9.4'
     implementation 'androidx.media3:media3-exoplayer-hls:1.9.4'
@@ -43,6 +49,9 @@ dependencies {
     implementation 'androidx.core:core:1.8.0'
     implementation 'androidx.recyclerview:recyclerview:1.3.0'
     testImplementation 'junit:junit:4.13.2'
+    // 单元测试跑在纯 JVM 上，android.jar 里的 org.json 是空 stub，
+    // 这里挂一份真实实现，让规则判定能在本地直接验证
+    testImplementation 'org.json:json:20240303'
     androidTestImplementation 'androidx.test:runner:1.6.2'
 }
 
@@ -50,17 +59,23 @@ dependencies {
 def includeLocalSources = providers.gradleProperty('includeLocalSources').orElse('true')
 def sourceCatalog = rootProject.file('local/default-sources.json')
 def liveCatalog = rootProject.file('local/default-live-sources.json')
+def subscriptionList = rootProject.file('local/default-subscription.txt')
 def generatedSourceAssets = layout.buildDirectory.dir('generated/sourceAssets')
 def prepareSourceAssets = tasks.register('prepareSourceAssets') {
     inputs.property('includeLocalSources', includeLocalSources)
     inputs.files(provider { includeLocalSources.get() == 'true' && sourceCatalog.exists() ? [sourceCatalog] : [] })
     inputs.files(provider { includeLocalSources.get() == 'true' && liveCatalog.exists() ? [liveCatalog] : [] })
+    inputs.files(provider { includeLocalSources.get() == 'true' && subscriptionList.exists() ? [subscriptionList] : [] })
     outputs.dir(generatedSourceAssets)
     doLast {
         def output = generatedSourceAssets.get().file('default-sources.json').asFile
         output.parentFile.mkdirs()
         output.text = includeLocalSources.get() == 'true' && sourceCatalog.exists() ? sourceCatalog.getText('UTF-8') : '{"sources":[]}'
         generatedSourceAssets.get().file('default-live-sources.json').asFile.text = includeLocalSources.get() == 'true' && liveCatalog.exists() ? liveCatalog.getText('UTF-8') : '{"subscriptions":[]}'
+        // The subscription URL list is private too: it lives in local/default-subscription.txt
+        // (git-ignored). Emit an empty file when absent so the startup sync always finds the asset.
+        generatedSourceAssets.get().file('default-subscription.txt').asFile.text =
+                includeLocalSources.get() == 'true' && subscriptionList.exists() ? subscriptionList.getText('UTF-8') : ''
     }
 }
 android.sourceSets.main.assets.srcDir(generatedSourceAssets)

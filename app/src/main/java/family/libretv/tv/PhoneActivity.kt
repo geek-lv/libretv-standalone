@@ -352,14 +352,26 @@ class PhoneActivity : Activity() {
         for(i in 0 until sources.length()) {
             val item=sources.getJSONObject(i);val row=buttonRow(saved).apply {gravity=Gravity.CENTER_VERTICAL}
             Switch(this).apply {
-                text=item.optString("name");setTextColor(Color.WHITE);isChecked=item.optBoolean("enabled",true);setPadding(dp(4),dp(12),dp(8),dp(12))
+                text=item.optString("name")+family.libretv.tv.safety.ContentFilterDialog.sourceLabel(item);setTextColor(Color.WHITE);isChecked=item.optBoolean("enabled",true);setPadding(dp(4),dp(12),dp(8),dp(12))
                 row.addView(this,LinearLayout.LayoutParams(0,-2,1f));setOnCheckedChangeListener {_,enabled->work("正在保存…"){withContext(Dispatchers.IO){client.local.setSourceEnabled(item.getString("key"),enabled)};sources=client.local.sources();notice.text="已保存"}}
             }
             button("⋮",row) {
-                libraryMenu(item.optString("name"),listOf("删除来源" to {
+                val key=item.optString("key")
+                val marked=family.libretv.tv.safety.ContentFilterConfig.isAdult(key)
+                val entries=mutableListOf<Pair<String,()->Unit>>()
+                if(marked) entries+=("取消成人标记" to {
+                    family.libretv.tv.safety.ContentFilterConfig.dismiss(key,item.optString("name"))
+                    family.libretv.tv.safety.AdultSourceStats.reset(key)
+                    sources=client.local.sources();notice.text="已取消标记，该来源重新参与搜索";login()
+                }) else entries+=("标记为成人源" to {
+                    family.libretv.tv.safety.ContentFilterConfig.markAdult(key,"手动标记",item.optString("name"))
+                    sources=client.local.sources();notice.text="已标记，锁定状态下该来源不再参与搜索";login()
+                })
+                entries+=("删除来源" to {
                     dialog=AlertDialog.Builder(this).setMessage("删除 ${item.optString("name")}？重启后不会自动补回。")
                         .setNegativeButton("取消",null).setPositiveButton("删除") {_,_->work("正在删除…"){withContext(Dispatchers.IO){client.local.removeSource(item.getString("key"))};sources=client.local.sources();results=JSONArray();login()}}.show()
-                }))
+                })
+                libraryMenu(item.optString("name"),entries)
             }.apply {contentDescription="来源管理 · "+item.optString("name");layoutParams=LinearLayout.LayoutParams(dp(48),dp(48))}
         }
         button("返回选片") { home() }
@@ -513,7 +525,7 @@ class PhoneActivity : Activity() {
             paint.shader=android.graphics.LinearGradient(0f,0f,dp(180).toFloat(),0f,intArrayOf(Color.rgb(255,147,191),accentColor),null,android.graphics.Shader.TileMode.CLAMP)
         }
 
-        val recent = PlaybackStore(this@PhoneActivity).all().optJSONObject(0)
+        val recent = PlaybackStore(this@PhoneActivity).allVisible().optJSONObject(0)
         if(recent != null) {
             val watching=section("继续观看")
             button("${recent.optString("title")} · 第 ${recent.optInt("index")+1} 集", watching, true) {
@@ -579,6 +591,12 @@ class PhoneActivity : Activity() {
         Switch(this).apply {text="首页推荐";setTextColor(Color.WHITE);setPadding(dp(4),dp(12),dp(4),dp(12));isChecked=recommendations.enabled();playback.addView(this);setOnCheckedChangeListener {_,enabled->recommendations.setEnabled(enabled)}}
         setting(playback,"投屏设备",device?.name ?: "选择接收设备") {chooseDevice()}
         if(queue!=null) setting(playback,"投屏控制",castTitle) {controls()}
+        setting(playback,"内容与播放保护",GuardSettingsDialog.summary(this)) {
+            GuardSettingsDialog.show(this) {
+                try { sources = client.local.sources() } catch(_: Exception) {}
+                if(page == "settings") settingsScreen()
+            }
+        }
         val app=section("应用",first)
         setting(app,"检查更新",BuildConfig.VERSION_NAME) {startActivity(android.content.Intent(this,UpdateActivity::class.java))}
         setting(app,"关于片刻") {PiankeUi.about(this)}
@@ -750,8 +768,10 @@ class PhoneActivity : Activity() {
     }
     private fun updateSearchResults() {
         if(page != "search") return
-        searchStatus?.text = if(searching) "正在搜索 · $searchCompleted / $searchTotal 个来源完成 · $searchFailed 个不可用\n结果会陆续出现，可直接点开观看"
-            else "搜索已结束 · $searchCompleted / $searchTotal 个来源完成 · $searchFailed 个不可用"
+        val hiddenCount = client.local.hiddenItems()
+        val hiddenHint = if(hiddenCount > 0) " · 内容过滤隐藏 $hiddenCount 条" else ""
+        searchStatus?.text = if(searching) "正在搜索 · $searchCompleted / $searchTotal 个来源完成 · $searchFailed 个不可用$hiddenHint\n结果会陆续出现，可直接点开观看"
+            else "搜索已结束 · $searchCompleted / $searchTotal 个来源完成 · $searchFailed 个不可用$hiddenHint"
         resultHeading?.text = if(results.length() == 0) {
             if(searching) "正在等待首个结果…" else "暂无结果，可更换片名或检查来源"
         } else "搜索结果 · ${results.length()}"
@@ -825,7 +845,7 @@ class PhoneActivity : Activity() {
         val desc=detailInfo.optString("desc")
         if(desc.isNotBlank()) info.addView(text(android.text.Html.fromHtml(desc).toString(),14f).apply {maxLines=4;setTextColor(secondaryColor)})
         val box = section("选择剧集 · 共 ${episodes.length()} 集",episodeParent)
-        box.addView(text(SegmentSkipStore.summary(this,title),13f).apply { setTextColor(accentColor) })
+        box.addView(text(SegmentSkipStore.summary(this,title),13f).apply {setTextColor(secondaryColor);setPadding(0,0,0,dp(6))})
         val columns = if(resources.configuration.fontScale > 1.3f) 2 else if(twoTouchColumns) ((touchContentWidthDp*.58f-32)/90).toInt().coerceIn(3,6) else 3
         for(start in 0 until episodes.length() step columns) {
             val row = buttonRow(box)
@@ -863,7 +883,7 @@ class PhoneActivity : Activity() {
     }
     private fun historyScreen() {
         screen("history","观看历史");libraryTabs("历史")
-        val history=PlaybackStore(this@PhoneActivity).all()
+        val history=PlaybackStore(this@PhoneActivity).allVisible()
         if(history.length()==0) {val empty=section("还没有观看记录");empty.addView(text("找一部喜欢的，留给这一刻。",14f));button("去搜索",empty,true){searchLanding()};return}
         val heading=content.getChildAt(0);content.removeView(heading)
         val titleRow=LinearLayout(this).apply {orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL}
@@ -892,7 +912,7 @@ class PhoneActivity : Activity() {
     }
     private fun playlistScreen() {
         screen("playlist","我的片单");libraryTabs("片单")
-        val store=PlaybackStore(this@PhoneActivity);val entries=store.playlist()
+        val store=PlaybackStore(this@PhoneActivity);val entries=store.playlistVisible()
         if(entries.length()==0) {content.addView(text("片单还是空的，去找一部想看的吧。",15f));button("去搜索",primary=true){searchLanding()}}
         for(i in 0 until entries.length()) {
             val entry=entries.getJSONObject(i);val item=entry.getJSONObject("item");val src=entry.getJSONObject("source");val saved=store.find(src,item)
