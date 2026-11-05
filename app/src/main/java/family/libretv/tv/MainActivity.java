@@ -70,13 +70,14 @@ public final class MainActivity extends Activity {
     private PlayerView playerView;
     private TextView playbackStatus;
     private LinearLayout playerTop, playerControls;
+    /** 片头片尾：按剧名记忆的自动跳过（移植自上游 0.21.0） */
+    private SegmentSkipController segmentSkip;
     private Button playToggle, subtitleButton, speedButton;
     private TextView seekPreview;
     private int tvSeekKey=KeyEvent.KEYCODE_UNKNOWN;
     private long lastTvSeekEvent;
     private final Runnable clearSeekPreview=()->{if(seekPreview!=null)seekPreview.setVisibility(View.GONE);};
     private SubtitleMenu subtitleMenu;
-    private SegmentSkipController segmentSkip;
     private android.app.AlertDialog playerOptions;
     private JSONObject detailSource;
     private String detailFavoriteId="";
@@ -105,6 +106,8 @@ public final class MainActivity extends Activity {
     };
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        // 预热 adskip 引擎（幂等）：避免进播放页后首 2 秒音频因模型加载被丢
+        new Thread(() -> family.libretv.tv.adskip.AdSkipController.get().init(getApplicationContext())).start();
         android.app.UiModeManager modes = (android.app.UiModeManager) getSystemService(UI_MODE_SERVICE);
         if (modes.getCurrentModeType() != android.content.res.Configuration.UI_MODE_TYPE_TELEVISION
                 && !getIntent().hasCategory(android.content.Intent.CATEGORY_LEANBACK_LAUNCHER)) {
@@ -445,6 +448,12 @@ public final class MainActivity extends Activity {
             PiankeUi.entry(panel,"直播订阅","电视频道 · M3U",()->startActivity(new Intent(this,LiveBrowseActivity.class).putExtra("openSources",true)));
         }else if(settingsSection==1){
             RecommendationRepository recommendations=new RecommendationRepository(this);Switch enabled=new Switch(this);enabled.setText("首页推荐");enabled.setTextSize(19);enabled.setTextColor(Color.WHITE);enabled.setPadding(dp(16),dp(16),dp(16),dp(16));enabled.setChecked(recommendations.enabled());panel.addView(enabled);enabled.setOnCheckedChangeListener((v,on)->recommendations.setEnabled(on));
+            family.libretv.tv.adskip.AdSkipConfig.init(this);
+            PiankeUi.entry(panel,"内容与播放保护",GuardSettingsDialog.summary(this),()->GuardSettingsDialog.show(this,()->{
+                if(client==null) return;
+                try { sources=client.local.sources(); loadSourceSelection(); } catch(Exception ex) { error(ex); return; }
+                showSettings();
+            }));
             panel.addView(label("方向键选择，确认执行。播放页隐藏控制时，按方向键唤出操作；直播左右键静默切台。",16));
         }else{
             panel.addView(PiankeUi.brand(this,96,96));panel.addView(label(PiankeUi.SLOGAN,17));
@@ -459,7 +468,7 @@ public final class MainActivity extends Activity {
         for(int i=0;i<sources.length();i++){
             JSONObject source=sources.optJSONObject(i);String key=source.optString("key");
             LinearLayout panel=row();panel.setGravity(Gravity.CENTER_VERTICAL);panel.setPadding(dp(16),dp(8),dp(16),dp(8));panel.setBackground(PiankeUi.surface(this,PiankeUi.PANEL,12));LinearLayout.LayoutParams pp=new LinearLayout.LayoutParams(-1,-2);pp.topMargin=dp(10);content.addView(panel,pp);
-            Switch choice=new Switch(this);choice.setText(source.optString("name"));choice.setTextColor(Color.WHITE);choice.setTextSize(18);choice.setChecked(enabledSources.contains(key));panel.addView(choice,new LinearLayout.LayoutParams(0,-2,1));
+            Switch choice=new Switch(this);choice.setText(source.optString("name")+family.libretv.tv.safety.ContentFilterDialog.sourceLabel(source));choice.setTextColor(Color.WHITE);choice.setTextSize(18);choice.setChecked(enabledSources.contains(key));panel.addView(choice,new LinearLayout.LayoutParams(0,-2,1));
             choice.setOnCheckedChangeListener((v,on)->{if(on)enabledSources.add(key);else enabledSources.remove(key);saveSourceSelection();});
             button(panel,"更多",()->new android.app.AlertDialog.Builder(this).setTitle(source.optString("name")).setItems(new String[]{"删除来源"},(d,w)->new android.app.AlertDialog.Builder(this).setMessage("删除后不会在重启时补回，是否删除？")
                 .setNegativeButton("取消",null).setPositiveButton("删除",(dialog,which)->task("正在删除…",()->{client.local.removeSource(key);return client.local.sources();},list->{sources=list;results=new JSONArray();loadSourceSelection();showVideoSources();})).show()).setNegativeButton("取消",null).show());
@@ -597,8 +606,10 @@ public final class MainActivity extends Activity {
     }
     private void updateSearchSummary() {
         if(screen!=Screen.SEARCH || searchSummary==null)return;
+        int hidden=(client!=null && client.local!=null) ? client.local.hiddenItems() : 0;
+        String hiddenHint=hidden>0 ? " · 内容过滤隐藏 "+hidden+" 条" : "";
         searchSummary.setText(query.isEmpty()?"输入片名开始搜索 · 收藏和进度保存在本机":
-            "「"+query+"」 · "+results.length()+" 个结果 · "+searchCompleted+" / "+searchTotal+" 个来源完成 · "+searchFailed+" 个不可用"+(searching?" · 正在搜索…":" · 已结束"));
+            "「"+query+"」 · "+results.length()+" 个结果 · "+searchCompleted+" / "+searchTotal+" 个来源完成 · "+searchFailed+" 个不可用"+hiddenHint+(searching?" · 正在搜索…":" · 已结束"));
         if(stopSearchButton!=null)stopSearchButton.setEnabled(searching);
     }
     private void performSearch(EditText keywords) {
@@ -671,6 +682,7 @@ public final class MainActivity extends Activity {
         if (!summary.trim().isEmpty()) info.addView(label(summary.trim(), 16));
         TextView source = label(selected.optString("sourceName") + "   ·   共 " + episodes.length() + " 集", 16);
         source.setTextColor(PiankeUi.PINK); info.addView(source);
+        info.addView(label(SegmentSkipStore.summary(this, title), 15));
         TextView description = label("", 16); description.setMaxLines(3);
         String desc = detailInfo.optString("desc");
         description.setText(desc.isEmpty() ? "选好剧集，开始观看。" : Html.fromHtml(desc));
@@ -740,7 +752,7 @@ public final class MainActivity extends Activity {
     }
     private void showPlaylist() {
         page(Screen.PLAYLIST,"我的片单");Button back=button(content,"‹ 返回首页",this::homeOrSearch);
-        PlaybackStore store=new PlaybackStore(this);JSONArray list=store.playlist();View first=null;
+        PlaybackStore store=new PlaybackStore(this);JSONArray list=store.playlistVisible();View first=null;
         if(list.length()==0)content.addView(label("片单还是空的，去找一部想看的吧。",21));
         try {for(int i=0;i<list.length();i++) {
             JSONObject entry=list.getJSONObject(i),source=entry.getJSONObject("source"),item=new JSONObject(entry.getJSONObject("item").toString()).put("favoriteSource",source);JSONObject saved=store.find(source,item);
@@ -828,11 +840,11 @@ public final class MainActivity extends Activity {
         subtitleButton=playerAction(settings,"字幕","subtitle",()->{if(subtitleMenu!=null){main.removeCallbacks(hidePlayerControls);subtitleMenu.show();}});
         playerAction(settings,"更多","more",this::showPlayerOptions);
         playerAction(settings,"返回选集","episodes",this::leavePlayer);
+        segmentSkip=new SegmentSkipController(this,title,()->{showControls(false);main.removeCallbacks(hidePlayerControls);},()->showControls(false),this::finishSkippedTvEpisode);
+        segmentSkip.addControls(playerControls,true);
         autoNext=new CheckBox(this);autoNext.setText("自动下一集");autoNext.setTextColor(Color.WHITE);
         autoNext.setChecked(getPreferences(MODE_PRIVATE).getBoolean("autoNext",true));
         autoNext.setOnCheckedChangeListener((v,on)->getPreferences(MODE_PRIVATE).edit().putBoolean("autoNext",on).apply());
-        segmentSkip = new SegmentSkipController(this, title, () -> {showControls(false); main.removeCallbacks(hidePlayerControls);}, () -> showControls(false), this::finishSkippedTvEpisode);
-        segmentSkip.addControls(playerControls, true);
         TextView hint=label("收起时：左右快退 / 快进，长按加速 · 上下唤出 · 返回收起",13);hint.setTextColor(PlayerStyle.MUTED);hint.setGravity(Gravity.CENTER);hint.setPadding(0,dp(8),0,0);playerControls.addView(hint);
         stage.addView(playerControls, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
         seekPreview=label("",20);seekPreview.setGravity(Gravity.CENTER);seekPreview.setPadding(dp(24),dp(12),dp(24),dp(12));
@@ -886,6 +898,8 @@ public final class MainActivity extends Activity {
     private void hideControls() {
         main.removeCallbacks(hidePlayerControls);
         if (screen != Screen.PLAYER) return;
+        // 片尾倒计时要能被看见和取消，不自动收起控制栏
+        if (segmentSkip != null && segmentSkip.isCountingDown()) return;
         controlsVisible = false; playerTop.setVisibility(View.GONE); playerControls.setVisibility(View.GONE);
         setSubtitleInset(false);
         playerView.requestFocus();
@@ -948,7 +962,7 @@ public final class MainActivity extends Activity {
         });
         player.setPlaybackSpeed(tvPlaybackSpeed());
         player.setMediaItem(item.build(), position); player.prepare(); player.setPlayWhenReady(playWhenReady);
-        segmentSkip.bind(player);
+        if(segmentSkip!=null)segmentSkip.bind(player);
         playerView.setKeepScreenOn(true); main.post(ticker);
     }
     private void togglePlay() { if (player != null) { if (player.getPlayWhenReady()) player.pause(); else player.play(); } }
@@ -957,16 +971,18 @@ public final class MainActivity extends Activity {
         long end = player.getDuration(); long next = Math.max(0, player.getCurrentPosition() + delta);
         player.seekTo(end > 0 ? Math.min(end, next) : next);
     }
-    private void finishSkippedTvEpisode() {
-        if (autoNext.isChecked() && episodeIndex + 1 < episodes.length()) switchTvEpisode(episodeIndex + 1);
-        else {player.pause(); saveTvProgress(); setNotice("本集片尾已跳过，可选集继续观看。"); showControls(true);}
-    }
     private void switchTvEpisode(int target) {
         if(target<0 || target>=episodes.length() || busy)return;
         releasePlayer();preparePlayback(target,false);
     }
+    private void finishSkippedTvEpisode() {
+        if(player==null)return;
+        if(autoNext.isChecked() && episodeIndex+1<episodes.length()) switchTvEpisode(episodeIndex+1);
+        else {player.pause();saveTvProgress();setNotice("本集片尾已跳过，可选集继续观看。");showControls(true);}
+    }
     private void saveTvProgress() {
-        if(player!=null)new PlaybackStore(this).save(detailSource,selected,title,episodeIndex,segmentSkip != null && segmentSkip.isCompleted() ? player.getDuration() : player.getCurrentPosition(),player.getDuration());
+        if(player!=null)new PlaybackStore(this).save(detailSource,selected,title,episodeIndex,
+                segmentSkip!=null && segmentSkip.isCompleted() ? player.getDuration() : player.getCurrentPosition(),player.getDuration());
     }
     private void releasePlayer() {
         if(segmentSkip!=null)segmentSkip.close();

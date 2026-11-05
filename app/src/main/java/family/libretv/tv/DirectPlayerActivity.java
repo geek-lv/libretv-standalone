@@ -24,6 +24,10 @@ import androidx.media3.common.*;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 import androidx.media3.ui.PlayerView;
+import family.libretv.tv.adskip.AdSkipConfig;
+import family.libretv.tv.adskip.AdSkipController;
+import family.libretv.tv.adskip.AdSkipRenderersFactory;
+import family.libretv.tv.adskip.AdSkipSettingsDialog;
 import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,8 +57,19 @@ public final class DirectPlayerActivity extends Activity {
     private Button previous, next, speed, subtitle;
     private Switch autoNext;
     private PlaybackStore history;
-    private SegmentSkipController segmentSkip;
     private SharedPreferences settings;
+    /** 片头片尾：按剧名记忆的自动跳过（移植自上游 0.21.0） */
+    private SegmentSkipController segmentSkip;
+    /** 广告跳过：探针挂载 + 识别状态机协调器 */
+    private final AdSkipController adSkip = AdSkipController.get();
+    /** 广告跳过触发 seek 的登记：窗口内的位置跳变不算用户手动 seek（保证幂等） */
+    private final PlayerSeekGuard adSkipSeek = new PlayerSeekGuard();
+    private final Runnable adSkipPositionPoller = new Runnable() {
+        @Override public void run() {
+            if (player != null && adSkip != null) adSkip.onPositionUpdate(player.getCurrentPosition());
+            main.postDelayed(this, 1000);
+        }
+    };
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Runnable checkpoint = new Runnable() {
         @Override public void run() { saveProgress(); main.postDelayed(this, 5000); }
@@ -67,6 +82,7 @@ public final class DirectPlayerActivity extends Activity {
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         history = new PlaybackStore(this);
         settings = getSharedPreferences("standalone-player", 0);
+        AdSkipConfig.init(this);
         urls = getIntent().getStringArrayListExtra("episodes");
         if (urls == null || urls.isEmpty()) urls = new ArrayList<>(Arrays.asList(getIntent().getStringExtra("url")));
         index = Math.max(0, Math.min(urls.size() - 1, getIntent().getIntExtra("index", 0)));
@@ -78,6 +94,19 @@ public final class DirectPlayerActivity extends Activity {
             if (saved != null && saved.optInt("index") == index)
                 position = PlaybackStore.resumePosition(saved.optLong("position"), saved.optLong("duration"));
         } catch (Exception ignored) { source = null; item = null; }
+        // 最后一道闸：本页是直接从 intent 拿播放地址的，不经过详情接口，
+        // 收藏/历史里的存量条目、外部跳转都可能绕过前面的过滤，这里按本地规则核一次。
+        family.libretv.tv.safety.ContentFilterConfig.init(this);
+        if (family.libretv.tv.safety.ContentGate.blockedItem(
+                title == null ? "" : title,
+                item == null ? null : item.optString("typeName"),
+                item == null ? null : item.optString("remarks"),
+                null, null)) {
+            android.widget.Toast.makeText(this, "该内容已被儿童锁拦截，到 设置 → 内容过滤 输入 PIN 可临时解锁",
+                    android.widget.Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
         if (state != null) {
             index = Math.max(0, Math.min(urls.size() - 1, state.getInt("index", index)));
             position = state.getLong("position"); resume = state.getBoolean("resume", true);
@@ -96,8 +125,17 @@ public final class DirectPlayerActivity extends Activity {
     private void changeOrientation(){setRequestedOrientation(landscape?ActivityInfo.SCREEN_ORIENTATION_PORTRAIT:ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);}
     @Override protected void onStart() {
         super.onStart();
+        // 引擎初始化放后台线程（模型加载数百毫秒），完成后若播放已 READY 则补一次启动。
+        // destroy() 会在 onStop 置 inited=false，因此每次 onStart 都要重新 init（幂等）。
+        new Thread(() -> {
+            adSkip.init(getApplicationContext());
+            main.post(() -> {
+                if (player != null && player.getPlaybackState() == Player.STATE_READY) {
+                    adSkip.onPlaybackStart(player.getCurrentPosition());
+                }
+            });
+        }, "adskip-init").start();
         boolean restoreControls=controlsVisible;
-        segmentSkip = new SegmentSkipController(this, title, this::holdControls, this::resumeControls, this::finishSkippedEpisode);
         landscape=getResources().getConfiguration().orientation==Configuration.ORIENTATION_LANDSCAPE;
         stage=new PlaybackGestureLayout(this);stage.setBackgroundColor(Color.BLACK);
         playerView=(PlayerView)LayoutInflater.from(this).inflate(R.layout.player_phone_view,stage,false);
@@ -153,7 +191,9 @@ public final class DirectPlayerActivity extends Activity {
             bottomChrome.addView(autoNext,new LinearLayout.LayoutParams(-1,dp(48)));
             setContentView(root);
         }
-        segmentSkip.addControls(bottomChrome, false);
+        segmentSkip=new SegmentSkipController(this,title,this::holdControls,this::resumeControls,this::finishSkippedEpisode);
+        segmentSkip.setForeignSeeks(adSkipSeek);
+        segmentSkip.addControls(bottomChrome,false);
         ViewCompat.setOnApplyWindowInsetsListener(landscape?stage:root,(v,insets)->{
             androidx.core.graphics.Insets bars=insets.getInsets(WindowInsetsCompat.Type.systemBars()|WindowInsetsCompat.Type.displayCutout());
             if(landscape){topChrome.setPadding(bars.left+dp(16),bars.top+dp(6),bars.right+dp(16),dp(12));bottomChrome.setPadding(bars.left+dp(20),dp(4),bars.right+dp(20),bars.bottom+dp(4));}
@@ -168,8 +208,20 @@ public final class DirectPlayerActivity extends Activity {
         applySystemBars();ViewCompat.requestApplyInsets(landscape?stage:root);
         try {
             NasClient direct = new NasClient(this);
-            player = new ExoPlayer.Builder(this).setMediaSourceFactory(new DefaultMediaSourceFactory(() -> new NasDataSource(direct))).build();
+            player = new ExoPlayer.Builder(this, new AdSkipRenderersFactory(this))
+                    .setMediaSourceFactory(new DefaultMediaSourceFactory(() -> new NasDataSource(direct))).build();
             playerView.setPlayer(player); playerView.setKeepScreenOn(true);
+            adSkip.setSeekHandler(new AdSkipController.SeekHandler() {
+                @Override public void seekTo(long positionMs) {
+                    adSkipSeek.mark();
+                    if (player != null) player.seekTo(positionMs);
+                }
+                @Override public void onAdSkipped(long fromMs, long toMs, String keyword) {
+                    Toast.makeText(DirectPlayerActivity.this,
+                            "已识别广告口播（" + keyword + "），跳过 " + (toMs - fromMs) / 1000 + " 秒",
+                            Toast.LENGTH_SHORT).show();
+                }
+            });
             stage.bind(player,playerView,topChrome,bottomChrome);stage.setVodSeekGestures(true);
             subtitles = new SubtitleMenu(this, player, subtitle, playerView.getSubtitleView(), settings, this::resumeControls, true);
             player.setPlaybackSpeed(settings.getFloat("speed", 1));
@@ -183,6 +235,9 @@ public final class DirectPlayerActivity extends Activity {
                     if (subtitles != null) subtitles.refresh();
                     if (state == Player.STATE_READY) {
                         updateHeading();
+                        adSkip.onPlaybackStart(player.getCurrentPosition());
+                        main.removeCallbacks(adSkipPositionPoller);
+                        main.postDelayed(adSkipPositionPoller, 1000);
                         if(source != null && item != null) try { history.add(source,item,title); }
                         catch(Exception ignored) { /* A full list must not interrupt playback. */ }
                     }
@@ -191,6 +246,19 @@ public final class DirectPlayerActivity extends Activity {
                         if (settings.getBoolean("autoNext",true) && index + 1 < urls.size()) switchEpisode(index + 1);
                         else {status.setText(title + " · 第 " + (index + 1) + " 集已播放完");playerView.showController();}
                     }
+                }
+                @Override public void onPositionDiscontinuity(Player.PositionInfo oldPosition, Player.PositionInfo newPosition, int reason) {
+                    // 只把显式 seek 上报为用户跳转；INTERNAL 跳变（倍速切换等）交给状态机的漂移校正兜底
+                    if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                        // 只有用户拖动才算主动跳转。本功能自己的 seek（广告跳过）和片头片尾
+                        // 发起的 seek 都不该让状态机清空已识别区间并重建识别上下文。
+                        boolean programmatic = adSkipSeek.isProgrammatic()
+                                || (segmentSkip != null && segmentSkip.isSeekingInternally());
+                        adSkip.onSeek(newPosition.positionMs, !programmatic);
+                    }
+                }
+                @Override public void onIsPlayingChanged(boolean isPlaying) {
+                    if (!isPlaying) adSkip.onPaused();
                 }
             });
             loadEpisode();
@@ -212,17 +280,20 @@ public final class DirectPlayerActivity extends Activity {
         updateHeading();
         MediaItem.Builder media = new MediaItem.Builder().setUri(url);
         if (url.toLowerCase(java.util.Locale.ROOT).contains(".m3u8")) media.setMimeType(MimeTypes.APPLICATION_M3U8);
-        segmentSkip.close();
+        // 换集/换源要重建监听，否则上一集的片尾倒计时会继续作用在新一集上
+        if(segmentSkip!=null)segmentSkip.close();
         player.setMediaItem(media.build()); player.seekTo(position); player.prepare(); player.setPlayWhenReady(resume);
-        segmentSkip.bind(player);
+        if(segmentSkip!=null)segmentSkip.bind(player);
     }
     private void finishSkippedEpisode() {
+        if (player == null) return;
         if (settings.getBoolean("autoNext", true) && index + 1 < urls.size()) switchEpisode(index + 1);
-        else { player.pause(); saveProgress(); status.setText("本集片尾已跳过"); playerView.showController(); }
+        else { player.pause(); saveProgress(); status.setText(title + " · 本集片尾已跳过"); playerView.showController(); }
     }
     private void switchEpisode(int target) {
         if (target < 0 || target >= urls.size() || player == null) return;
         saveProgress(); index = target; position = 0; resume = true;
+        adSkip.onEpisodeChange();
         try { loadEpisode(); } catch (Exception e) { status.setText("无法播放：" + e.getMessage()); }
     }
     private void chooseSpeed() {
@@ -253,10 +324,14 @@ public final class DirectPlayerActivity extends Activity {
         }
     }
     private void showMore(){
-        holdControls();String[] options={player!=null&&player.getPlayerError()!=null?"重试播放":"从头播放", "自动下一集 · "+(settings.getBoolean("autoNext",true)?"开启":"关闭")};
+        holdControls();String[] options={player!=null&&player.getPlayerError()!=null?"重试播放":"从头播放", "自动下一集 · "+(settings.getBoolean("autoNext",true)?"开启":"关闭"), "广告跳过设置 · "+(adSkip.isEnabled()?"关键词"+adSkipKeywordSummary():"未配置")};
         dialog=new AlertDialog.Builder(this).setTitle("更多播放设置").setItems(options,(d,which)->{
-            if(which==0&&player!=null){if(player.getPlayerError()!=null)player.prepare();else player.seekTo(0);player.play();}else if(which==1)autoNext.setChecked(!settings.getBoolean("autoNext",true));
+            if(which==0&&player!=null){if(player.getPlayerError()!=null)player.prepare();else player.seekTo(0);player.play();}else if(which==1)autoNext.setChecked(!settings.getBoolean("autoNext",true));else if(which==2){AdSkipSettingsDialog.show(this);updateHeading();}
         }).setOnDismissListener(d->resumeControls()).show();
+    }
+    private String adSkipKeywordSummary(){
+        int count=family.libretv.tv.adskip.AdSkipConfig.getKeywordCount();
+        return count+"个 · "+family.libretv.tv.adskip.AdSkipConfig.getSkipSeconds()+"s";
     }
     private void chooseEpisode(){
         holdControls();String[] labels=new String[urls.size()];for(int i=0;i<labels.length;i++)labels[i]="第 "+(i+1)+" 集";
@@ -291,7 +366,10 @@ public final class DirectPlayerActivity extends Activity {
         else super.onBackPressed();
     }
     private void saveProgress() {
-        if (player != null) history.save(source, item, title, index, segmentSkip != null && segmentSkip.isCompleted() ? player.getDuration() : player.getCurrentPosition(), player.getDuration());
+        if (player == null) return;
+        // 片尾已跳过的集按片长记，回来时不会再从头看一遍片尾
+        long position = segmentSkip != null && segmentSkip.isCompleted() ? player.getDuration() : player.getCurrentPosition();
+        history.save(source, item, title, index, position, player.getDuration());
     }
     @Override protected void onSaveInstanceState(Bundle state) {
         state.putFloat("windowBrightness",getWindow().getAttributes().screenBrightness);
@@ -301,12 +379,17 @@ public final class DirectPlayerActivity extends Activity {
         state.putLong("position", player == null ? position : player.getCurrentPosition());
         state.putBoolean("resume", player == null ? resume : player.getPlayWhenReady()); super.onSaveInstanceState(state);
     }
-    @Override protected void onPause() { saveProgress(); super.onPause(); }
+    @Override protected void onPause() {
+        if (player != null && adSkip != null) adSkip.onPaused();
+        saveProgress(); super.onPause();
+    }
     @Override protected void onStop() {
-        if(segmentSkip!=null)segmentSkip.close();
+        main.removeCallbacks(adSkipPositionPoller);
         if(stage!=null)stage.release();
         main.removeCallbacks(checkpoint); if (dialog != null) dialog.dismiss(); if (subtitles != null) subtitles.close();
+        if (segmentSkip != null) segmentSkip.close();
         if (player != null) { saveProgress(); position = player.getCurrentPosition(); resume = player.getPlayWhenReady(); player.release(); player = null; }
+        adSkip.destroy();
         super.onStop();
     }
 }

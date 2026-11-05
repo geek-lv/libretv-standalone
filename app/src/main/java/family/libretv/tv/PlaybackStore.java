@@ -11,10 +11,25 @@ final class PlaybackStore {
     private final SharedPreferences prefs;
     PlaybackStore(Context context) {
         prefs = context.getApplicationContext().getSharedPreferences("standalone-playback", 0);
+        family.libretv.tv.safety.ContentFilterConfig.init(context);
         synchronized (LOCK) {
             // One-time upgrade: keep existing viewing progress visible in the new list.
             if(!prefs.contains("playlist")) prefs.edit().putString("playlist",all().toString()).commit();
         }
+    }
+
+    /**
+     * 供界面展示的历史/片单：锁定时剔除疑似成人的存量条目。
+     *
+     * <p>只过滤展示用的副本，{@link #all()} 与 {@link #playlist()} 保持原样——
+     * 删除、去重、续播都要基于完整数据，否则会误删别的记录。
+     */
+    JSONArray allVisible() {
+        return family.libretv.tv.safety.ContentGate.filterRecords(all());
+    }
+
+    JSONArray playlistVisible() {
+        return family.libretv.tv.safety.ContentGate.filterRecords(playlist());
     }
     static String identity(JSONObject source, JSONObject item) {
         return source.optString("url").replaceAll("/+$", "") + "|" + item.optString("vodId");

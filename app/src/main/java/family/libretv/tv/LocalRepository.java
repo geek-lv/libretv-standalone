@@ -2,6 +2,10 @@ package family.libretv.tv;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.Log;
+import family.libretv.tv.safety.AdultRules;
+import family.libretv.tv.safety.AdultSourceStats;
+import family.libretv.tv.safety.ContentFilterConfig;
 import org.json.*;
 import java.io.*;
 import java.net.*;
@@ -9,17 +13,73 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** On-device CMS requests and storage. No NAS service or login is involved. */
 final class LocalRepository {
     private final SharedPreferences prefs;
+    /** 本次搜索中被内容过滤隐藏的条目数，供界面提示 */
+    private static final AtomicInteger HIDDEN = new AtomicInteger();
+    private volatile int lastHidden;
     static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36";
     private static final Object DEFAULTS_LOCK = new Object();
     LocalRepository(Context context) throws Exception {
         prefs = context.getApplicationContext().getSharedPreferences("standalone-library", 0);
+        ContentFilterConfig.init(context);
+        AdultSourceStats.init(context);
         try (InputStream in = context.getAssets().open("default-sources.json")) {
             mergeDefaults(prefs, parseSources(read(in, 1024 * 1024), true));
         }
+        classifyStoredSources();
+        scheduleSubscriptionSync(context.getApplicationContext());
+    }
+
+    /** 对已保存的来源做一次本地名称初判：只用字符串规则，不发任何请求 */
+    private void classifyStoredSources() {
+        try {
+            JSONArray stored = allSources();
+            for (int i = 0; i < stored.length(); i++) {
+                JSONObject source = stored.getJSONObject(i);
+                String key = source.optString("key");
+                if (ContentFilterConfig.hasMark(key)) continue; // 保留用户的手动否决
+                String why = AdultRules.matchSourceName(source.optString("name"), null);
+                if (why != null) ContentFilterConfig.markAdult(key, why, source.optString("name"));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static final ExecutorService SUBSCRIPTION_SYNC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "subscription-sync"); t.setDaemon(true); return t;
+    });
+
+    /**
+     * Fetch the bundled TVBox subscription and merge its type=1 CMS sites as
+     * default sources. Runs in background; failures are silent (subscription
+     * being unreachable must never block startup). First reachable URL wins.
+     */
+    static void scheduleSubscriptionSync(Context context) {
+        SUBSCRIPTION_SYNC.execute(() -> {
+            try (InputStream in = context.getAssets().open("default-subscription.txt")) {
+                for (String url : read(in, 64 * 1024).split("\\s+")) {
+                    url = url.trim();
+                    if (url.isEmpty()) continue;
+                    try {
+                        JSONArray catalog = parseSources(fetch(url));
+                        if (catalog.length() > 0) {
+                            mergeDefaults(context.getSharedPreferences("standalone-library", 0), catalog);
+                            Log.i("LibreTV", "订阅同步成功: " + url + " -> " + catalog.length() + " 个源");
+                            return;
+                        }
+                        Log.w("LibreTV", "订阅无可用源: " + url);
+                    } catch (Exception e) {
+                        Log.w("LibreTV", "订阅拉取失败: " + url + " (" + e + ")");
+                    }
+                }
+            } catch (Exception e) {
+                Log.w("LibreTV", "读取内置订阅地址失败: " + e);
+            }
+        });
     }
     /** Append each newly shipped URL once; never restore a removed default or change user flags. */
     static void mergeDefaults(SharedPreferences prefs, JSONArray catalog) throws Exception {
@@ -44,14 +104,53 @@ final class LocalRepository {
                 throw new IOException("默认来源保存失败，请重新打开应用重试");
         }
     }
-    synchronized JSONArray sources() throws Exception { return new JSONArray(prefs.getString("sources", "[]")); }
+    /** 全部来源（含被内容过滤隐藏的），仅供内部统计与合并保存使用 */
+    synchronized JSONArray allSources() throws Exception { return new JSONArray(prefs.getString("sources", "[]")); }
+
+    /**
+     * 对界面可见的来源列表。
+     *
+     * <p>锁定状态下直接剔除被判为成人的来源；临时解锁后保留它们，并打上 {@code adult} 标记
+     * 供界面显示 18+，方便自己确认过滤是否生效。
+     */
+    synchronized JSONArray sources() throws Exception {
+        JSONArray all = allSources();
+        if (!ContentFilterConfig.enabled()) return all;
+        boolean unlocked = ContentFilterConfig.unlocked();
+        JSONArray visible = new JSONArray();
+        for (int i = 0; i < all.length(); i++) {
+            JSONObject source = all.getJSONObject(i);
+            String key = source.optString("key");
+            if (!ContentFilterConfig.isAdult(key)) { visible.put(source); continue; }
+            if (!unlocked) continue;
+            JSONObject marked = new JSONObject(source.toString());
+            marked.put("adult", true);
+            marked.put("adultWhy", ContentFilterConfig.markReason(key));
+            visible.put(marked);
+        }
+        return visible;
+    }
+
     synchronized void saveSources(JSONArray sources) throws Exception {
-        if (!prefs.edit().putString("sources", sources.toString()).commit()) throw new IOException("配置保存失败");
+        // 界面拿到的是过滤后的列表；写回时把没被传进来的来源原样保留，避免过滤把配置删掉。
+        // 判定依据是"key 不在本次写回里"，而不是"被标成成人"——白名单模式下被隐藏的
+        // 非成人来源同样不能因为一次开关写入就消失（删除走 removeSource）。
+        JSONArray merged = new JSONArray(sources.toString());
+        Set<String> incoming = new HashSet<>();
+        for (int i = 0; i < merged.length(); i++) incoming.add(merged.getJSONObject(i).optString("key"));
+        JSONArray stored = allSources();
+        for (int i = 0; i < stored.length(); i++) {
+            JSONObject source = stored.getJSONObject(i);
+            if (!incoming.contains(source.optString("key"))) merged.put(source);
+        }
+        if (!prefs.edit().putString("sources", merged.toString()).commit()) throw new IOException("配置保存失败");
     }
     synchronized void removeSource(String key) throws Exception {
-        JSONArray next = new JSONArray(), all = sources();
+        JSONArray next = new JSONArray(), all = allSources();
         for(int i=0;i<all.length();i++) if(!all.getJSONObject(i).optString("key").equals(key)) next.put(all.getJSONObject(i));
-        saveSources(next);
+        // 直接整体写回：走 saveSources 的合并逻辑会把刚删掉的成人源加回来
+        if (!prefs.edit().putString("sources", next.toString()).commit()) throw new IOException("配置保存失败");
+        ContentFilterConfig.unmark(key);
     }
     synchronized void setSourceEnabled(String key, boolean enabled) throws Exception {
         JSONArray all = sources();
@@ -95,12 +194,20 @@ final class LocalRepository {
             JSONObject item=list.optJSONObject(i);if(item==null || item.optBoolean("isAdult"))continue;
             if(tvbox && item.optInt("type",-1)!=1) continue;
             String url=item.optString(tvbox?"api":"url").trim().replaceAll("/+$", "");
-            validate(url);
+            if(tvbox) {
+                String lower=url.toLowerCase(Locale.ROOT);
+                if(lower.endsWith(".js") || lower.endsWith(".xml")) continue; // Spider/JS & XML sources unsupported
+            }
+            try { validate(url); } catch (IOException e) { continue; } // skip malformed entries instead of failing the whole import
             if(!seen.add(url)) continue;
             if(result.length()>=50) throw new IOException("一次最多导入 50 个源");
             JSONObject source=new JSONObject().put("key",key(url)).put("name",item.optString("name","自定义源")).put("url",url).put("enabled",item.optBoolean("enabled",true));
             if (allowEmpty && item.optBoolean("legacyDefault")) source.put("legacyDefault", true);
             String detail=item.optString("detail").trim();if(!detail.isEmpty()){validate(detail);source.put("detail",detail);}
+            // 名称层面先记一笔：真正是否隐藏由锁定状态决定，这里只做标记，不改来源本身。
+            String adultWhy=AdultRules.matchSourceName(source.optString("name"), null);
+            if(adultWhy!=null && !ContentFilterConfig.hasMark(source.getString("key")))
+                ContentFilterConfig.markAdult(source.getString("key"),adultWhy,source.optString("name"));
             result.put(source);
         }
         if(result.length()==0 && !allowEmpty) throw new IOException("没有可导入的 CMS JSON 源（暂不支持 Spider/JAR）");
@@ -153,7 +260,15 @@ final class LocalRepository {
     JSONObject search(String wd, JSONArray selected, SearchListener listener) throws Exception {
         if(selected==null) selected=sources();
         List<JSONObject> enabled=new ArrayList<>();
-        for(int i=0;i<selected.length();i++) if(selected.getJSONObject(i).optBoolean("enabled",true)) enabled.add(selected.getJSONObject(i));
+        boolean locked=ContentFilterConfig.enabled() && !ContentFilterConfig.unlocked();
+        for(int i=0;i<selected.length();i++) {
+            JSONObject candidate=selected.getJSONObject(i);
+            if(!candidate.optBoolean("enabled",true)) continue;
+            // 锁定时连请求都不发：成人源既不出现，也不参与搜索
+            if(locked && ContentFilterConfig.isAdult(candidate.optString("key"))) continue;
+            enabled.add(candidate);
+        }
+        HIDDEN.set(0);
         if(enabled.isEmpty()) throw new IOException("请先在来源配置中至少启用一个来源");
         ExecutorService pool=Executors.newFixedThreadPool(Math.min(4,enabled.size()));
         CompletionService<JSONArray> ready=new ExecutorCompletionService<>(pool);
@@ -164,14 +279,29 @@ final class LocalRepository {
         try {
             for(JSONObject source:enabled) pending.put(ready.submit(()->{
                 JSONArray found=new JSONArray();
+                final String skey=source.optString("key"),sname=source.optString("name");
+                // 整块判定素材：本来源所有分页的命中情况，攒完再下结论
+                final family.libretv.tv.safety.AdultSourceStats.Block block=
+                        ContentFilterConfig.enabled()&&!ContentFilterConfig.unlocked()
+                                ?new family.libretv.tv.safety.AdultSourceStats.Block():null;
                 JSONObject first=new JSONObject(fetch(api(source.getString("url"),"wd",wd)+"&pg=1"));
-                appendResults(found,first,source,wd);
+                appendResults(found,first,source,wd,block);
                 int pages=Math.max(1,Math.min(5,first.optInt("pagecount",1)));
                 for(int p=2;p<=pages;p++) {
+                    // 已定性为成人源：整块都要丢弃，继续翻页只是白耗流量
+                    if(block!=null&&ContentFilterConfig.isAdult(skey)) break;
                     if(Thread.currentThread().isInterrupted() || System.nanoTime()>deadline) break;
-                    try { appendResults(found,new JSONObject(fetch(api(source.getString("url"),"wd",wd)+"&pg="+p)),source,wd); }
+                    try { appendResults(found,new JSONObject(fetch(api(source.getString("url"),"wd",wd)+"&pg="+p)),source,wd,block); }
                     catch(InterruptedIOException e) { throw e; }
                     catch(Exception ignored) {}
+                }
+                // 先判后出：结论必须在交付给界面之前下，命中就整块丢弃，
+                // 界面上一条都不会出现（而不是先显示再回收）
+                if(block!=null&&family.libretv.tv.safety.AdultSourceStats.judgeBlock(skey,sname,block)){
+                    Log.i("ContentFilter","丢弃结果块: "+sname+"（"+(found.length())+" 条，"
+                            +(ContentFilterConfig.isAdult(skey)?"已永久标记":"本次先丢弃")+"）");
+                    HIDDEN.addAndGet(found.length());
+                    return new JSONArray();
                 }
                 return found;
             }),source);
@@ -185,6 +315,8 @@ final class LocalRepository {
                     JSONArray got=done.get();
                     for(int j=0;j<got.length();j++) {
                         JSONObject item=got.getJSONObject(j);
+                        // 兜底：并发期间被其它搜索标记为成人源的，交付前再核一次
+                        if(locked&&ContentFilterConfig.isAdult(item.optString("sourceKey"))) {HIDDEN.incrementAndGet();continue;}
                         if(seen.add(item.optString("sourceKey")+":"+item.optString("vodId"))) { list.put(item); added.put(item); }
                     }
                 } catch(ExecutionException e) {
@@ -198,15 +330,32 @@ final class LocalRepository {
                 if(listener!=null) listener.onSource(new JSONArray(),enabled.size(),enabled.size(),failures.length());
             }
         } finally { for(Future<?> future:pending.keySet()) future.cancel(true); pool.shutdownNow(); }
-        return new JSONObject().put("list",list).put("failures",failures);
+        lastHidden=HIDDEN.get();
+        return new JSONObject().put("list",list).put("failures",failures).put("hidden",lastHidden);
     }
+    /** 本次搜索被内容过滤隐藏的条目数；0 表示没有命中 */
+    int hiddenItems(){return lastHidden;}
     static String normalize(String s){return s.toLowerCase(Locale.ROOT).replaceAll("[\\s\\p{P}\\p{S}]+","");}
-    static void appendResults(JSONArray out,JSONObject payload,JSONObject source,String wd)throws Exception{
+    static void appendResults(JSONArray out,JSONObject payload,JSONObject source,String wd,family.libretv.tv.safety.AdultSourceStats.Block block)throws Exception{
         JSONArray list=payload.optJSONArray("list");if(list==null)return;
+        // 解锁状态下不再逐条过滤：解锁本身就是明确意图，否则解锁没有意义
+        boolean filter=ContentFilterConfig.enabled()&&!ContentFilterConfig.unlocked();
+        boolean number=ContentFilterConfig.numberRegex();
+        boolean scanDesc=ContentFilterConfig.scanDescription();
+        List<String> extra=filter?ContentFilterConfig.extraKeywords():null;
+        // 响应里自带的分类清单是站点级判定的输入，属于同一次请求的附带数据，不额外抓取
+        if(filter&&block!=null&&block.classReason==null)
+            block.classReason=family.libretv.tv.safety.AdultSourceStats.observeClasses(source.optString("key"),source.optString("name"),payload.optJSONArray("class"));
+        int hits=0,strong=0;
         for(int i=0;i<list.length();i++){
             JSONObject vod=list.optJSONObject(i);if(vod==null)continue;
             String name=vod.optString("vod_name"),type=vod.optString("type_name");
-            if(type.matches(".*(伦理|倫理|福利|情色|成人|里番).*"))continue;
+            if(block!=null)block.seen++;
+            if(filter){
+                String why=AdultRules.matchItem(name,type,vod.optString("vod_remarks"),vod.optString("vod_area"),
+                        scanDesc?vod.optString("vod_content"):null,number,extra,ContentFilterConfig.strictSuggestive());
+                if(why!=null){hits++;if(AdultRules.isStrongReason(why))strong++;HIDDEN.incrementAndGet();continue;}
+            }
             String normalized=normalize(name);boolean relevant=normalized.contains(normalize(wd));
             if(!relevant && wd.trim().contains(" ")){relevant=true;for(String token:wd.trim().split("\\s+"))if(!normalized.contains(normalize(token)))relevant=false;}
             if(!relevant)continue;
@@ -214,6 +363,7 @@ final class LocalRepository {
                 .put("vodId",vod.optString("vod_id")).put("name",name).put("pic",vod.optString("vod_pic")).put("remarks",vod.optString("vod_remarks")).put("typeName",type);
             out.put(item);
         }
+        if(block!=null)block.count(hits,strong);
     }
     static JSONArray episodes(String play) {
         List<JSONArray> groups=new ArrayList<>();
@@ -242,11 +392,24 @@ final class LocalRepository {
         if(eps.length()==0)throw new IOException(failure==null?"此来源未提供可播放剧集":failure.getMessage());
         JSONObject info=new JSONObject().put("sourceKey",source.getString("key")).put("sourceName",source.getString("name")).put("sourceUrl",source.getString("url"));
         if(vod!=null){String[][] fields={{"title","vod_name"},{"cover","vod_pic"},{"desc","vod_content"},{"year","vod_year"},{"area","vod_area"},{"remarks","vod_remarks"}};for(String[] f:fields)info.put(f[0],vod.optString(f[1]));}
+        // 兜底：收藏、历史、手输 ID 都可能绕过搜索结果过滤，进详情前再判一次。
+        if(ContentFilterConfig.enabled() && !ContentFilterConfig.unlocked()){
+            String why=AdultRules.matchItem(info.optString("title"),vod==null?null:vod.optString("type_name"),
+                    info.optString("remarks"),info.optString("area"),
+                    ContentFilterConfig.scanDescription()?info.optString("desc"):null,
+                    ContentFilterConfig.numberRegex(),ContentFilterConfig.extraKeywords(),ContentFilterConfig.strictSuggestive());
+            if(why!=null) throw new IOException("该内容已被儿童锁拦截（"+why+"）。到 设置 → 内容过滤 输入 PIN 可临时解锁。");
+        }
         return new JSONObject().put("episodes",eps).put("videoInfo",info);
     }
     synchronized JSONObject favorites(String route,JSONObject body,String method)throws Exception{
         JSONArray all=new JSONArray(prefs.getString("favorites","[]"));
-        if(method.equals("GET"))return new JSONObject().put("items",all);
+        if(method.equals("GET")){
+            // 收藏是"存量"数据：过滤上线前收的成人条目也要在列表里消失，
+            // 否则片名和封面照样能看见（点进去虽被 detail 拦，但已经露了）
+            JSONArray visible=family.libretv.tv.safety.ContentGate.filterRecords(all);
+            return new JSONObject().put("items",visible==null?all:visible);
+        }
         if(method.equals("POST")){
             JSONObject source=body.getJSONObject("source"),item=body.getJSONObject("item");String id=key(source.getString("url")+":"+item.getString("vodId"));
             for(int i=0;i<all.length();i++)if(all.getJSONObject(i).getString("id").equals(id))return new JSONObject().put("item",all.getJSONObject(i));

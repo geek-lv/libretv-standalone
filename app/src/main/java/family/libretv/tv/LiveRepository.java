@@ -12,6 +12,8 @@ final class LiveRepository {
     final SharedPreferences prefs;
     LiveRepository(Context context) throws Exception {
         prefs=context.getApplicationContext().getSharedPreferences("live-library",0);
+        family.libretv.tv.safety.ContentFilterConfig.init(context);
+        family.libretv.tv.safety.AdultSourceStats.init(context);
         try(InputStream in=context.getAssets().open("default-live-sources.json")) {
             JSONArray defaults=new JSONObject(LocalRepository.read(in,1024*1024)).optJSONArray("subscriptions");
             if(defaults!=null)synchronized(LOCK){
@@ -88,7 +90,9 @@ final class LiveRepository {
         String id="file-"+LocalRepository.key(name);JSONArray parsed=encode(id,M3uPlaylist.parse(text));
         synchronized(LOCK){JSONArray all=subscriptions(),next=new JSONArray();boolean found=false;for(int i=0;i<all.length();i++){JSONObject s=all.getJSONObject(i);if(s.optString("id").equals(id))found=true;next.put(s);}if(!found){if(all.length()>=10)throw new IOException("最多保存10个直播订阅");next.put(subscription(id,name,"",true));}if(!prefs.edit().putString("subscriptions",next.toString()).putString("cache-"+id,parsed.toString()).putLong("updated-"+id,System.currentTimeMillis()).commit())throw new IOException("频道导入失败");}return id;
     }
-    JSONArray channels()throws Exception {JSONArray all=subscriptions(),result=new JSONArray();for(int i=0;i<all.length();i++){JSONObject s=all.getJSONObject(i);if(!s.optBoolean("enabled",true))continue;JSONArray cache=new JSONArray(prefs.getString("cache-"+s.getString("id"),"[]"));for(int j=0;j<cache.length();j++)result.put(cache.getJSONObject(j));}return result;}
+    JSONArray channels()throws Exception {JSONArray all=subscriptions(),result=new JSONArray();for(int i=0;i<all.length();i++){JSONObject s=all.getJSONObject(i);if(!s.optBoolean("enabled",true))continue;JSONArray cache=new JSONArray(prefs.getString("cache-"+s.getString("id"),"[]"));for(int j=0;j<cache.length();j++)result.put(cache.getJSONObject(j));}
+        // 内容过滤：成人直播通常整组命名，锁定时按频道名/分组整体隐藏（只读过滤，不改缓存）
+        return family.libretv.tv.safety.ContentGate.filterChannels(result);}
     JSONObject channel(String id)throws Exception {JSONArray all=channels();for(int i=0;i<all.length();i++)if(id.equals(all.getJSONObject(i).optString("id")))return all.getJSONObject(i);return null;}
     boolean favorite(String id){return prefs.getStringSet("favorites",Collections.emptySet()).contains(id);}
     void toggleFavorite(String id){synchronized(LOCK){Set<String> set=new HashSet<>(prefs.getStringSet("favorites",Collections.emptySet()));if(!set.remove(id))set.add(id);prefs.edit().putStringSet("favorites",set).commit();}}
